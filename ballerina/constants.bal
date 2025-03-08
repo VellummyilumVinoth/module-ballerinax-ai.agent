@@ -25,6 +25,10 @@ const OPENAPI_COMPONENTS_KEY = "components";
 const OPENAPI_PATTERN_DATE = "yyyy-MM-dd";
 const OPENAPI_PATTERN_DATE_TIME = "yyyy-MM-dd'T'HH:mm:ssZ";
 
+// claude
+const CLAUDE_MODEL_NAME = "claude-3-7-sonnet-20250219";
+const CLAUDE_API_VERSION = "2023-06-01";
+
 //agent
 const THOUGHT_KEY = "Thought:";
 const BACKTICKS = "```";

@@ -16,6 +16,7 @@
 
 import ballerinax/azure.openai.chat as azure_chat;
 import ballerinax/openai.chat;
+import ballerina/http;
 
 // TODO: change the configs to extend the config record from the respective clients.
 // requirs using never prompt?; never stop? to prevent setting those during initialization
@@ -35,6 +36,14 @@ public type ChatModelConfig readonly & record {|
     string model = GPT3_5_MODEL_NAME;
     # Temperature value to be used for the completion. Default is `0.7`.
     decimal temperature = DEFAULT_TEMPERATURE;
+|};
+
+# Claude Chat model configurations.
+public type ClaudeChatModelConfig readonly & record {|
+    # Model type to be used for the completion. Default is `claude-3-7-sonnet-20250219`
+    string model = CLAUDE_MODEL_NAME;
+    # Maximum number of tokens to generate in the response. Default is `512`
+    int max_tokens = DEFAULT_MAX_TOKEN_COUNT;
 |};
 
 # User chat message record.
@@ -101,6 +110,90 @@ public type FunctionCall record {|
     string name;
     # Arguments of the function
     string arguments;
+|};
+
+# Connection configuration for Claude API
+public type ClaudeConnectionConfig readonly & record {|
+    # API key for Claude API
+    string apiKey;
+    # Claude API version
+    string apiVersion = CLAUDE_API_VERSION;
+|};
+
+# Claude API request message format
+public type ClaudeMessage record {|
+    # Role of the participant in the conversation (e.g., "user" or "assistant")
+    string role;
+    # The message content
+    string content;
+|};
+
+# Claude API response format
+public type ClaudeApiResponse record {|
+    # Unique identifier for the response message
+    string id;
+    # The Claude model used for generating the response
+    string model;
+    # The type of the response (e.g., "message")
+    string 'type;
+    # Array of content blocks containing the response text and media
+    ContentBlock[] content;
+    # Role of the message sender (typically "assistant")
+    string role;
+    # Reason why the generation stopped (e.g., "end_turn", "max_tokens")
+    string stop_reason;
+    # The sequence that caused generation to stop, if applicable
+    string? stop_sequence;
+    # Token usage statistics for the request and response
+    Usage usage;
+|};
+
+# Content block in Claude API response
+public type ContentBlock record {|
+    # The type of content (e.g., "text" or "tool_use")
+    string 'type;
+    # The actual text content (for text type)
+    string text?;
+    # Tool use information (for tool_use type)
+    string id?;
+    # Name of the tool being used
+    string name?;
+    # Input parameters for the tool
+    json input?;
+|};
+
+# Usage statistics in Claude API response
+public type Usage record {|
+    # Number of tokens in the input messages
+    int input_tokens;
+    # Number of tokens in the generated response
+    int output_tokens;
+    # Number of input tokens used for cache creation, if applicable
+    int? cache_creation_input_tokens = ();
+    # Number of input tokens read from cache, if applicable
+    int? cache_read_input_tokens = ();
+|};
+
+# Claude API request format
+public type ClaudeApiRequest record {|
+    # The Claude model to use (e.g., "claude-3-7-sonnet-20250219")
+    string model = CLAUDE_MODEL_NAME;
+    # Maximum number of tokens to generate in the response
+    int max_tokens = DEFAULT_MAX_TOKEN_COUNT;
+    # Array of messages in the conversation history
+    ClaudeMessage[] messages;
+    # Optional array of tools that Claude can use
+    ClaudeTool[]? tools = ();
+|};
+
+# Claude Tool definition
+public type ClaudeTool record {|
+    # Name of the tool
+    string name;
+    # Description of the tool
+    string description;
+    # Input schema of the tool in JSON Schema format
+    json input_schema;
 |};
 
 # Represents an extendable client for interacting with an AI model.
@@ -225,3 +318,193 @@ public isolated client class AzureOpenAiModel {
     }
 }
 
+public isolated client class ClaudeModel {
+    *Model;
+    final http:Client claudeClient;
+    final ClaudeChatModelConfig modelConfig;
+    final string apiVersion;
+    final string apiKey;
+
+    # Initializes the Claude model with the given connection configuration and model configuration.
+    #
+    # + connectionConfig - Connection Configuration for Claude API client
+    # + modelConfig - Model Configuration for Claude API client
+    # + return - Error if the model initialization fails
+    public isolated function init(ClaudeConnectionConfig connectionConfig, ClaudeChatModelConfig modelConfig = {}) returns Error? {
+        http:ClientConfiguration httpConfig = {};
+        
+        http:Client httpClient;
+        do {
+            httpClient = check new http:Client("https://api.anthropic.com/v1", httpConfig);
+        } on fail var e {
+            return error Error("Failed to initialize ClaudeModel", e);
+        }
+        
+        self.claudeClient = httpClient;
+        self.modelConfig = modelConfig;
+        self.apiVersion = connectionConfig.apiVersion;
+        self.apiKey = connectionConfig.apiKey;
+    }
+
+    # Converts standard ChatMessage array to Claude's message format
+    # 
+    # + messages - parameter description
+    # + return - return value description
+    isolated function mapToClaudeMessages(ChatMessage[] messages) returns ClaudeMessage[] {
+        ClaudeMessage[] claudeMessages = [];
+        
+        foreach ChatMessage message in messages {
+            if message is ChatUserMessage {
+                claudeMessages.push({
+                    role: "user",
+                    content: message.content
+                });
+            } else if message is ChatSystemMessage {
+                // Add a user message containing the system prompt
+                claudeMessages.push({
+                    role: "user",
+                    content: string `<system>${message.content}</system>\n\n`
+                });
+            } else if message is ChatAssistantMessage {
+                if message.content is string {
+                    claudeMessages.push({
+                        role: "assistant",
+                        content: message.content ?: ""
+                    });
+                }
+            } else if message is ChatFunctionMessage {
+                if message.content is string {
+                    // Include function results as user messages with special formatting
+                    claudeMessages.push({
+                        role: "user",
+                        content: string `<function_results>\nFunction: ${message.name}\nOutput: ${message.content ?: ""}\n</function_results>`
+                    });
+                }
+            }
+        }
+        
+        return claudeMessages;
+    }
+
+    # Maps ChatCompletionFunctions to Claude's tool format
+    # 
+    # + tools - Array of tool definitions
+    # + return - Array of Claude tool definitions
+    isolated function mapToClaudeTools(ChatCompletionFunctions[] tools) returns ClaudeTool[] {
+        ClaudeTool[] claudeTools = [];
+        
+        foreach ChatCompletionFunctions tool in tools {
+            JsonInputSchema schema = tool.parameters ?: { 'type: "object", properties: {} };
+            
+            // Create Claude tool with input_schema instead of parameters
+            ClaudeTool claudeTool = {
+                name: tool.name,
+                description: tool.description,
+                input_schema: schema
+            };
+            
+            claudeTools.push(claudeTool);
+        }
+        
+        return claudeTools;
+    }
+
+    # Uses Claude API to generate a response
+    # + messages - List of chat messages 
+    # + tools - Tool definitions to be used for the tool call
+    # + stop - Stop sequence to stop the completion (not used in this implementation)
+    # + return - Chat response or an error in case of failures
+    isolated remote function chat(ChatMessage[] messages, ChatCompletionFunctions[] tools = [], string? stop = ())
+        returns ChatAssistantMessage|LlmError {
+        
+        // Map messages to Claude format
+        ClaudeMessage[] claudeMessages = self.mapToClaudeMessages(messages);
+        
+        // Prepare request payload
+        map<json> requestPayload = {
+            "model": self.modelConfig.model,
+            "max_tokens": self.modelConfig.max_tokens,
+            "messages": claudeMessages
+        };
+        
+        // If tools are provided, add them to the request
+        if tools.length() > 0 {
+            ClaudeTool[] claudeTools = self.mapToClaudeTools(tools);
+            requestPayload["tools"] = claudeTools;
+        }
+        
+        // Send request to Claude API with proper headers
+        http:Request httpRequest = new;
+        httpRequest.setHeader("x-api-key", self.apiKey);
+        httpRequest.setHeader("anthropic-version", self.apiVersion);
+        httpRequest.setHeader("content-type", "application/json");
+        httpRequest.setJsonPayload(requestPayload);
+        
+        http:Response|error response = self.claudeClient->post("/messages", httpRequest);
+        
+        if response is error {
+            return error LlmConnectionError("Error while connecting to Claude API", response);
+        }
+        
+        if response.statusCode != 200 {
+            string|error errorMsg = response.getTextPayload();
+            string errText = errorMsg is string ? errorMsg : "Unknown error";
+            return error LlmConnectionError(string `Claude API returned status code ${response.statusCode}: ${errText}`);
+        }
+
+        json|error responseJson = response.getJsonPayload();
+        if responseJson is error {
+            return error LlmInvalidResponseError("Failed to parse Claude API response", responseJson);
+        }
+        
+        string responseText = "";
+        FunctionCall? functionCall = ();
+        
+        json|error contentJson = responseJson.content;
+        if !(contentJson is json[]) {
+            return error LlmInvalidResponseError("Invalid or missing content array in Claude API response");
+        }
+        
+        json[] contentBlocks = contentJson;
+        boolean hasToolUse = false;
+        foreach json block in contentBlocks {
+            json|error typeJson = block.'type;
+            if !(typeJson is json && typeJson is string) {
+                continue; 
+            }
+            
+            string blockType = typeJson;            
+            if blockType == "tool_use" {
+                json|error nameJson = block.name;
+                json|error inputJson = block.input;
+                
+                if nameJson is json && nameJson is string && inputJson is json {
+                    functionCall = {
+                        name: nameJson,
+                        arguments: inputJson.toJsonString()
+                    };
+                    hasToolUse = true;
+                    break;
+                }
+            } else if blockType == "text" && !hasToolUse {
+                json|error textJson = block.text;
+                if textJson is json && textJson is string {
+                    responseText += textJson;
+                }
+            }
+        }
+
+        // Return appropriate response based on whether we got a tool_use
+        if hasToolUse && functionCall != () {
+            return {
+                role: ASSISTANT,
+                function_call: functionCall
+            };
+        } else {
+            return {
+                role: ASSISTANT,
+                content: responseText
+            };
+        }
+    }
+}
